@@ -242,7 +242,7 @@ def send_status_report():
     if state["stage"] == "active" and pos["entry"]:
         change = (price - pos["entry"]) / pos["entry"] * 100 if price else 0
         send(
-            f"📈 *Status pozycji*\n\n"
+            f"📈 *Dzienny raport pozycji*\n\n"
             f"Kurs wejścia: `{pos['entry']:.6f}`\n"
             f"Kurs obecny:  `{price:.6f}`\n"
             f"Zmiana: `{change:+.2f}%`\n"

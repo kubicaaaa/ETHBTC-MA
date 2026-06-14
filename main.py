@@ -8,6 +8,7 @@ Flow:
   4. Wizualizuje outcome SL i TP przy 0.1 ETH pożyczki
   5. Monitoruje pozycję i alarmuje gdy SL lub TP osiągnięty
   6. Wykrywa golden cross → sugeruje zamknięcie
+  7. Codziennie o 8:00 wysyła raport statusu pozycji
 
 Wymagania:
     pip install requests schedule
@@ -35,6 +36,7 @@ CHECK_INTERVAL_HOURS = 1
 CANDLES_LIMIT        = 250
 LOAN_ETH             = 0.1          # stała wielkość pożyczki
 STATE_FILE           = "bot_state.json"   # plik stanu (przeżywa restart)
+DAILY_REPORT_TIME    = "08:00"      # czas lokalny systemu (sprawdź timezone!)
 
 # ─── LOGGING ─────────────────────────────────────────────────────────────────
 
@@ -247,6 +249,34 @@ def reset_position(reason: str):
     save_state(state)
     log.info(f"Pozycja zamknięta: {reason}")
 
+# ─── DZIENNY RAPORT STATUSU ──────────────────────────────────────────────────
+
+def send_status_report():
+    """Wysyła raport statusu — wywoływane przez /status oraz codziennie o 8:00."""
+    closes = get_ethbtc_closes(CANDLES_LIMIT)
+    price  = closes[-1] if closes else None
+    pos    = state["position"]
+
+    if state["stage"] == "active" and pos["entry"]:
+        change = (price - pos["entry"]) / pos["entry"] * 100 if price else 0
+        send(
+            f"📈 *Status pozycji*\n\n"
+            f"Kurs wejścia: `{pos['entry']:.6f}`\n"
+            f"Kurs obecny:  `{price:.6f}`\n"
+            f"Zmiana: `{change:+.2f}%`\n"
+            f"SL: `+{pos['sl_pct']}%` | TP: `-{pos['tp_pct']}%`\n"
+            f"Otwarto: {pos['opened_at'][:16]}"
+        )
+    else:
+        if price:
+            send(f"ℹ️ Brak aktywnej pozycji.\nETH/BTC: `{price:.6f}`")
+        else:
+            send("ℹ️ Brak aktywnej pozycji.")
+
+def daily_status_job():
+    log.info("Wysyłanie dziennego raportu statusu (8:00)...")
+    send_status_report()
+
 # ─── OBSŁUGA WIADOMOŚCI OD UŻYTKOWNIKA ───────────────────────────────────────
 
 def handle_user_input():
@@ -318,21 +348,7 @@ def handle_user_input():
 
     # ── Komenda /status ──
     elif msg.lower() in ("/status", "status"):
-        closes = get_ethbtc_closes(CANDLES_LIMIT)
-        price  = closes[-1] if closes else None
-        pos    = state["position"]
-        if state["stage"] == "active" and pos["entry"]:
-            change = (price - pos["entry"]) / pos["entry"] * 100 if price else 0
-            send(
-                f"📈 *Status pozycji*\n\n"
-                f"Kurs wejścia: `{pos['entry']:.6f}`\n"
-                f"Kurs obecny:  `{price:.6f}`\n"
-                f"Zmiana: `{change:+.2f}%`\n"
-                f"SL: `+{pos['sl_pct']}%` | TP: `-{pos['tp_pct']}%`\n"
-                f"Otwarto: {pos['opened_at'][:16]}"
-            )
-        else:
-            send(f"ℹ️ Brak aktywnej pozycji.\nETH/BTC: `{price:.6f}`" if price else "ℹ️ Brak aktywnej pozycji.")
+        send_status_report()
 
     # ── Komenda /close (ręczne zamknięcie) ──
     elif msg.lower() in ("/close", "close", "zamknij"):
@@ -432,6 +448,7 @@ if __name__ == "__main__":
     market_job()  # od razu przy starcie
 
     schedule.every(CHECK_INTERVAL_HOURS).hours.do(market_job)
+    schedule.every().day.at(DAILY_REPORT_TIME).do(daily_status_job)
 
     while True:
         handle_user_input()

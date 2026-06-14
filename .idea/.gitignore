@@ -3,3 +3,7 @@
 /workspace.xml
 # Editor-based HTTP Client requests
 /httpRequests/
+.env
+bot_state.json
+__pycache__/
+*.pyc

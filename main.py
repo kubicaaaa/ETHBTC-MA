@@ -25,12 +25,15 @@ import requests
 import schedule
 import logging
 import os
+from dotenv import load_dotenv
 from datetime import datetime
 
 # ─── KONFIGURACJA ────────────────────────────────────────────────────────────
 
-TELEGRAM_BOT_TOKEN = ""
-TELEGRAM_CHAT_ID = ""
+load_dotenv()  # wczytuje zmienne z pliku .env
+
+TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+TELEGRAM_CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]
 
 CHECK_INTERVAL_HOURS = 1
 CANDLES_LIMIT        = 250

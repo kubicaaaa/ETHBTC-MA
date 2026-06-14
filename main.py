@@ -1,24 +1,3 @@
-"""
-ETH/BTC MA Signal Bot — Telegram z zarządzaniem pozycją
-========================================================
-Flow:
-  1. Bot wykrywa sygnał wejścia (below_ma50 / below_ma200 / death_cross)
-  2. Pyta czy otworzyłeś pożyczkę [Tak/Nie]
-  3. Jeśli Tak → pyta o kurs wejścia, SL%, TP%
-  4. Wizualizuje outcome SL i TP przy 0.1 ETH pożyczki
-  5. Monitoruje pozycję i alarmuje gdy SL lub TP osiągnięty
-  6. Wykrywa golden cross → sugeruje zamknięcie
-  7. Codziennie o 8:00 wysyła raport statusu pozycji
-
-Wymagania:
-    pip install requests schedule
-
-Konfiguracja:
-    1. Utwórz bota przez @BotFather → TELEGRAM_BOT_TOKEN
-    2. Napisz do bota /start, sprawdź chat_id przez getUpdates
-    3. Uzupełnij TELEGRAM_BOT_TOKEN i TELEGRAM_CHAT_ID poniżej
-"""
-
 import time
 import json
 import requests

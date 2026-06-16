@@ -16,9 +16,10 @@ TELEGRAM_CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]
 
 CHECK_INTERVAL_HOURS = 1
 CANDLES_LIMIT        = 250
-LOAN_ETH             = 0.1          # stała wielkość pożyczki
-STATE_FILE           = "bot_state.json"   # plik stanu (przeżywa restart)
-DAILY_REPORT_TIME    = "08:00"      # czas lokalny systemu (sprawdź timezone!)
+LOAN_ETH             = 0.1
+STATE_FILE           = "bot_state.json"
+TRANSACTIONS_FILE    = "transactions.json"
+DAILY_REPORT_TIME    = "08:00"
 
 # ─── LOGGING ─────────────────────────────────────────────────────────────────
 
@@ -30,13 +31,6 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ─── STAN ────────────────────────────────────────────────────────────────────
-# Etapy konwersacji:
-#   idle          → brak aktywnej pozycji, bot monitoruje rynek
-#   ask_opened    → wysłano sygnał, czekamy czy użytkownik otworzył pożyczkę
-#   ask_entry     → czekamy na kurs wejścia ETH/BTC
-#   ask_sl        → czekamy na stop-loss %
-#   ask_tp        → czekamy na take-profit %
-#   active        → pozycja otwarta, bot monitoruje SL/TP
 
 def load_state() -> dict:
     if os.path.exists(STATE_FILE):
@@ -49,9 +43,9 @@ def load_state() -> dict:
         "stage":        "idle",
         "last_signals": [],
         "position": {
-            "entry":  None,   # kurs ETH/BTC przy wejściu
-            "sl_pct": None,   # stop-loss %
-            "tp_pct": None,   # take-profit %
+            "entry":     None,
+            "sl_pct":    None,
+            "tp_pct":    None,
             "opened_at": None,
         },
         "last_update_id": 0,
@@ -63,11 +57,59 @@ def save_state(state: dict):
 
 state = load_state()
 
+# ─── TRANSAKCJE ──────────────────────────────────────────────────────────────
+
+def load_transactions() -> list:
+    if os.path.exists(TRANSACTIONS_FILE):
+        try:
+            with open(TRANSACTIONS_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return []
+
+def save_transaction(exit_price: float | None, reason: str):
+    """Zapisuje zamkniętą pozycję do transactions.json."""
+    pos          = state["position"]
+    transactions = load_transactions()
+
+    entry     = pos["entry"]
+    sl_pct    = pos["sl_pct"]
+    tp_pct    = pos["tp_pct"]
+    opened_at = pos["opened_at"]
+    closed_at = datetime.now().isoformat()
+
+    # Oblicz wynik jeśli znamy kurs wyjścia
+    pnl_eth = None
+    if entry and exit_price:
+        btc_held  = LOAN_ETH * entry
+        eth_out   = btc_held / exit_price
+        pnl_eth   = round(eth_out - LOAN_ETH, 6)
+
+    transaction = {
+        "opened_at":   opened_at,
+        "closed_at":   closed_at,
+        "entry_price": entry,
+        "exit_price":  exit_price,
+        "sl_pct":      sl_pct,
+        "tp_pct":      tp_pct,
+        "loan_eth":    LOAN_ETH,
+        "pnl_eth":     pnl_eth,
+        "reason":      reason,   # "sl_hit" | "tp_hit" | "manual"
+    }
+
+    transactions.append(transaction)
+
+    with open(TRANSACTIONS_FILE, "w") as f:
+        json.dump(transactions, f, indent=2)
+
+    log.info(f"Transakcja zapisana: {reason} | P&L: {pnl_eth} ETH")
+
 # ─── DANE RYNKOWE ────────────────────────────────────────────────────────────
 
 def get_ethbtc_closes(limit: int = 250) -> list[float]:
-    since = int(time.time()) - (limit * 86400)
-    url   = "https://api.kraken.com/0/public/OHLC"
+    since  = int(time.time()) - (limit * 86400)
+    url    = "https://api.kraken.com/0/public/OHLC"
     params = {"pair": "ETHXBT", "interval": 1440, "since": since}
     try:
         resp = requests.get(url, params=params, timeout=10)
@@ -139,29 +181,25 @@ def get_user_message() -> str | None:
 # ─── WIZUALIZACJA OUTCOME ────────────────────────────────────────────────────
 
 def build_outcome_message(entry: float, sl_pct: float, tp_pct: float) -> str:
-    loan   = LOAN_ETH
+    loan = LOAN_ETH
 
-    # TP: ETH/BTC spada → odkupujesz ETH taniej → zostaje nadwyżka
-    tp_rate    = entry * (1 - tp_pct / 100)
-    btc_held   = loan * entry              # BTC kupione za pożyczone ETH
-    eth_at_tp  = btc_held / tp_rate       # ETH po odkupie przy TP
-    profit_tp  = eth_at_tp - loan         # nadwyżka ETH
+    tp_rate   = entry * (1 - tp_pct / 100)
+    btc_held  = loan * entry
+    eth_at_tp = btc_held / tp_rate
+    profit_tp = eth_at_tp - loan
 
-    # SL: ETH/BTC rośnie → odkupujesz ETH drożej → strata
-    sl_rate    = entry * (1 + sl_pct / 100)
-    eth_at_sl  = btc_held / sl_rate
-    loss_sl    = loan - eth_at_sl         # brakująca ETH (dopłacasz z depozytu)
+    sl_rate   = entry * (1 + sl_pct / 100)
+    eth_at_sl = btc_held / sl_rate
+    loss_sl   = loan - eth_at_sl
 
-    # Pasek wizualny
     def bar(value: float, max_val: float, width: int = 10, positive: bool = True) -> str:
-        filled = round(abs(value) / max_val * width)
-        filled = min(filled, width)
+        filled = min(round(abs(value) / max_val * width), width)
         char   = "█" if positive else "▓"
         return char * filled + "░" * (width - filled)
 
     max_val = max(profit_tp, loss_sl, 0.001)
 
-    msg = (
+    return (
         f"📊 *Wizualizacja pozycji* (pożyczka: {loan} ETH)\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"📍 *Kurs wejścia:* `{entry:.6f}` ETH/BTC\n\n"
@@ -181,7 +219,20 @@ def build_outcome_message(entry: float, sl_pct: float, tp_pct: float) -> str:
         f"💡 Stosunek zysk/strata: `{profit_tp/loss_sl:.2f}:1`\n"
         f"_Bot będzie monitorował pozycję i powiadomi przy osiągnięciu SL lub TP._"
     )
-    return msg
+
+# ─── P&L POMOCNICZE ──────────────────────────────────────────────────────────
+
+def calc_pnl(entry: float, current_price: float) -> tuple[float, float]:
+    """
+    Zwraca (pnl_pct, pnl_eth) z perspektywy pozycji short ETH/BTC.
+    ETH/BTC spada  → pnl_pct dodatni  → zarabiamy.
+    ETH/BTC rośnie → pnl_pct ujemny   → tracimy.
+    """
+    btc_held  = LOAN_ETH * entry
+    eth_out   = btc_held / current_price
+    pnl_eth   = eth_out - LOAN_ETH
+    pnl_pct   = (entry - current_price) / entry * 100   # odwrócony znak względem ruchu kursu
+    return pnl_pct, pnl_eth
 
 # ─── MONITOROWANIE AKTYWNEJ POZYCJI ─────────────────────────────────────────
 
@@ -194,36 +245,40 @@ def check_position(current_price: float):
     sl_pct = pos["sl_pct"]
     tp_pct = pos["tp_pct"]
 
-    change_pct = (current_price - entry) / entry * 100  # + = ETH/BTC rośnie (źle)
+    # Zmiana kursu ETH/BTC względem wejścia (+ = kurs rośnie = źle dla nas)
+    price_change_pct = (current_price - entry) / entry * 100
 
-    if change_pct >= sl_pct:
+    if price_change_pct >= sl_pct:
+        save_transaction(current_price, "sl_hit")
         send(
             f"🚨 *STOP LOSS OSIĄGNIĘTY!*\n\n"
             f"Kurs wejścia: `{entry:.6f}`\n"
             f"Kurs obecny:  `{current_price:.6f}`\n"
-            f"Zmiana: `+{change_pct:.1f}%` (SL: {sl_pct}%)\n\n"
+            f"Kurs ETH/BTC wzrósł o `+{price_change_pct:.1f}%` → P&L: `-{price_change_pct:.1f}%`\n\n"
             f"💡 Kup ETH za WBTC na DEX → spłać {LOAN_ETH} ETH na Aave → zamknij pozycję."
         )
         reset_position("sl_hit")
 
-    elif change_pct <= -tp_pct:
-        loan    = LOAN_ETH
-        btc     = loan * entry
-        eth_out = btc / current_price
-        profit  = eth_out - loan
+    elif price_change_pct <= -tp_pct:
+        pnl_pct, pnl_eth = calc_pnl(entry, current_price)
+        save_transaction(current_price, "tp_hit")
         send(
             f"🎯 *TAKE PROFIT OSIĄGNIĘTY!*\n\n"
             f"Kurs wejścia: `{entry:.6f}`\n"
             f"Kurs obecny:  `{current_price:.6f}`\n"
-            f"Zmiana: `{change_pct:.1f}%` (TP: -{tp_pct}%)\n\n"
-            f"Odkupujesz: `{eth_out:.5f}` ETH\n"
-            f"Zysk: `+{profit:.5f}` ETH\n\n"
+            f"Kurs ETH/BTC spadł o `{price_change_pct:.1f}%` → P&L: `+{pnl_pct:.1f}%`\n\n"
+            f"Odkupujesz: `{LOAN_ETH + pnl_eth:.5f}` ETH\n"
+            f"Zysk: `+{pnl_eth:.5f}` ETH\n\n"
             f"💡 Kup ETH za WBTC na DEX → spłać {LOAN_ETH} ETH na Aave → zgarnij zysk."
         )
         reset_position("tp_hit")
 
     else:
-        log.info(f"Pozycja aktywna | ETH/BTC={current_price:.6f} | zmiana={change_pct:+.2f}%")
+        pnl_pct, pnl_eth = calc_pnl(entry, current_price)
+        log.info(
+            f"Pozycja aktywna | ETH/BTC={current_price:.6f} | "
+            f"kurs: {price_change_pct:+.2f}% | P&L: {pnl_pct:+.2f}% ({pnl_eth:+.5f} ETH)"
+        )
 
 def reset_position(reason: str):
     state["stage"]    = "idle"
@@ -231,7 +286,7 @@ def reset_position(reason: str):
     save_state(state)
     log.info(f"Pozycja zamknięta: {reason}")
 
-# ─── DZIENNY RAPORT STATUSU ──────────────────────────────────────────────────
+# ─── DZIENNY RAPORT / STATUS ──────────────────────────────────────────────────
 
 def send_status_report():
     """Wysyła raport statusu — wywoływane przez /status oraz codziennie o 8:00."""
@@ -239,14 +294,21 @@ def send_status_report():
     price  = closes[-1] if closes else None
     pos    = state["position"]
 
-    if state["stage"] == "active" and pos["entry"]:
-        change = (price - pos["entry"]) / pos["entry"] * 100 if price else 0
+    if state["stage"] == "active" and pos["entry"] and price:
+        price_change_pct = (price - pos["entry"]) / pos["entry"] * 100
+        pnl_pct, pnl_eth = calc_pnl(pos["entry"], price)
+
+        # Emoji zależne od P&L
+        pnl_emoji = "🟢" if pnl_pct >= 0 else "🔴"
+
         send(
-            f"📈 *Dzienny raport pozycji*\n\n"
+            f"📈 *Status pozycji*\n\n"
             f"Kurs wejścia: `{pos['entry']:.6f}`\n"
             f"Kurs obecny:  `{price:.6f}`\n"
-            f"Zmiana: `{change:+.2f}%`\n"
-            f"SL: `+{pos['sl_pct']}%` | TP: `-{pos['tp_pct']}%`\n"
+            f"Zmiana kursu ETH/BTC: `{price_change_pct:+.2f}%`\n"
+            f"{pnl_emoji} P&L pozycji: `{pnl_pct:+.2f}%` (`{pnl_eth:+.5f}` ETH)\n\n"
+            f"SL przy: `+{pos['sl_pct']}%` kursu → P&L `-{pos['sl_pct']}%`\n"
+            f"TP przy: `-{pos['tp_pct']}%` kursu → P&L `+{pos['tp_pct']}%`\n\n"
             f"Otwarto: {pos['opened_at'][:16]}"
         )
     else:
@@ -268,7 +330,6 @@ def handle_user_input():
 
     log.info(f"Wiadomość od użytkownika: '{msg}' | stage: {state['stage']}")
 
-    # ── Etap: czy otworzyłeś pożyczkę? ──
     if state["stage"] == "ask_opened":
         if msg.lower() in ("tak", "yes", "✅ tak"):
             state["stage"] = "ask_entry"
@@ -282,7 +343,6 @@ def handle_user_input():
             send("Odpowiedz *Tak* lub *Nie* — czy otworzyłeś pożyczkę na Aave?",
                  keyboard=[["✅ Tak", "❌ Nie"]])
 
-    # ── Etap: podaj kurs wejścia ──
     elif state["stage"] == "ask_entry":
         try:
             entry = float(msg.replace(",", "."))
@@ -296,7 +356,6 @@ def handle_user_input():
         except ValueError:
             send("❌ Nieprawidłowa wartość. Podaj kurs jako liczbę, np. `0.02534`:")
 
-    # ── Etap: podaj SL ──
     elif state["stage"] == "ask_sl":
         try:
             sl = float(msg.replace(",", ".").replace("%", ""))
@@ -310,7 +369,6 @@ def handle_user_input():
         except ValueError:
             send("❌ Nieprawidłowa wartość. Podaj liczbę, np. `15`:")
 
-    # ── Etap: podaj TP → aktywuj pozycję ──
     elif state["stage"] == "ask_tp":
         try:
             tp = float(msg.replace(",", ".").replace("%", ""))
@@ -320,21 +378,22 @@ def handle_user_input():
             state["position"]["opened_at"] = datetime.now().isoformat()
             state["stage"] = "active"
             save_state(state)
-
-            pos = state["position"]
-            outcome_msg = build_outcome_message(pos["entry"], pos["sl_pct"], pos["tp_pct"])
-            send(outcome_msg)
-
+            send(build_outcome_message(
+                state["position"]["entry"],
+                state["position"]["sl_pct"],
+                state["position"]["tp_pct"],
+            ))
         except ValueError:
             send("❌ Nieprawidłowa wartość. Podaj liczbę, np. `20`:")
 
-    # ── Komenda /status ──
     elif msg.lower() in ("/status", "status"):
         send_status_report()
 
-    # ── Komenda /close (ręczne zamknięcie) ──
     elif msg.lower() in ("/close", "close", "zamknij"):
         if state["stage"] == "active":
+            closes = get_ethbtc_closes(CANDLES_LIMIT)
+            exit_price = closes[-1] if closes else None
+            save_transaction(exit_price, "manual")
             reset_position("manual")
             send("✅ Pozycja zamknięta ręcznie. Bot wraca do monitorowania rynku.")
         else:
@@ -358,11 +417,8 @@ def market_job():
 
     log.info(f"ETH/BTC={price:.6f} | MA50={ma50:.6f} | MA200={ma200:.6f} | stage={state['stage']}")
 
-    # Monitoruj aktywną pozycję
     if state["stage"] == "active":
         check_position(price)
-
-        # Golden cross przy aktywnej pozycji → dodatkowy alert
         if ma50_prev and ma200_prev and ma50_prev <= ma200_prev and ma50 > ma200:
             send(
                 f"✅ *GOLDEN CROSS przy aktywnej pozycji!*\n\n"
@@ -372,12 +428,10 @@ def market_job():
             )
         return
 
-    # Jeśli czekamy na odpowiedź użytkownika → nie nadpisuj sygnałami
     if state["stage"] != "idle":
         return
 
-    # Wykryj sygnały wejścia
-    last = set(state["last_signals"])
+    last        = set(state["last_signals"])
     now_signals = []
 
     if price < ma50:
@@ -406,7 +460,6 @@ def market_job():
         )
         state["stage"] = "ask_opened"
 
-    # Golden cross przy idle → informacja
     if ma50_prev and ma200_prev and ma50_prev <= ma200_prev and ma50 > ma200:
         send(
             f"✅ *Golden Cross* — MA50 ({ma50:.6f}) przecięła MA200 ({ma200:.6f}) od dołu.\n"
@@ -427,7 +480,7 @@ if __name__ == "__main__":
         "• /close — zamknij pozycję ręcznie"
     )
 
-    market_job()  # od razu przy starcie
+    market_job()
 
     schedule.every(CHECK_INTERVAL_HOURS).hours.do(market_job)
     schedule.every().day.at(DAILY_REPORT_TIME).do(daily_status_job)
@@ -435,4 +488,4 @@ if __name__ == "__main__":
     while True:
         handle_user_input()
         schedule.run_pending()
-        time.sleep(30)   # odpytuj Telegram co 30s
+        time.sleep(30)

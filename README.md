@@ -36,6 +36,12 @@ The bot displays P&L from your position's perspective, separate from the raw pri
 
 ---
 
+## Preview
+
+![Bot screenshot](assets/screenshot.png)
+
+---
+
 ## Project Structure
 
 ```
